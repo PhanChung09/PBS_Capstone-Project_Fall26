@@ -1,0 +1,1366 @@
+---
+title: "PBS Modeling"
+subtitle: "Exploring models to predict potential donors for PBS Utah"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show the code"
+execute:
+  warning: true
+  message: false
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+# Load packages and set seed
+pacman::p_load(tidyverse, knitr, caret, estimatr, sandwich, lmtest, marginaleffects)
+seed_val <- 1235
+set.seed(seed_val)
+
+# Load Data
+unite_payments <- readRDS("data/r/unite_payments.rds")
+soft_credits <- readRDS("data/r/soft_credits.rds")
+team_approach_legacy_payments <- readRDS("data/r/team_approach_legacy_payments.rds")
+cultivation <- readRDS("data/r/cultivation.rds")
+# The campaign lists are read for one check in the Lapsed Donors section; no model uses them
+campaign_members <- readRDS("data/r/campaign_members.rds")
+
+# Set up calendar year and band functions
+fy <- function(date) year(date) + (month(date) >= 7)
+in_band <- function(x) x >= 1200 & x <= 25000
+```
+
+# Executive Summary
+
+On May 1 2025, President Trump signed executive order 14290, directing the Corporation for Public Broadcasting to stop funding PBS and NPR. This left PBS scrambling to find new sources of funding, including PBS Utah. The shortfall for PBS Utah amounted to ~$230,000/year. This project explores the potential of using machine learning to predict potential donors for PBS Utah.
+
+# What We Learned in Data Exploration
+
+The EDA (`team/rex/eda.qmd` and `deliverables/group_eda.qmd`) settled three things before any model: what one row is, what counts as success, and which fields are safe to use. This section collects the facts that decide how Model 1 (ranking donors) and Model 2 (the effect of officer contact) get built. Finding numbers refer to `eda.qmd`. The numbers here are quoted from those documents; the sections that follow recompute them.
+
+## The target
+
+- **One row is a person in a fiscal year.** The problem statement says household, but couples look like random pairs who give like strangers.
+- **Success is a total of $1,200 to $25,000 in the next fiscal year.** The project uses the terminology "band" to refer to the different levels of giving. $1,200 exactly is in, above $25,000 is out, and soft credits count toward the total.
+- **Success is rare.** 74 to 139 people a year from FY2014 to FY2026. Only 127 out of 38,350 people donated in FY2026; ~0.3%.
+  - Model 1: this is a ranking problem. Accuracy is useless, because "no" for everyone is about 99.7% right. Score a list by precision at k and PR-AUC, and decide how to weight the rare positives when fitting.
+  - Model 2: only 8 of the held-out nominees gave in the band the next year. With so few cases, we can't say exactly how much contact helps. A narrow range means we are fairly sure of the effect. A wide range means the true effect could be much smaller or much larger than our best guess. The data can't fix this, and waiting is slow. A nominee counts as a success only if they give the following year, so every answer arrives a year late. The newest nominees in the data joined in FY2025, and we saw their result in FY2026. Anyone picked in FY2026 gets their result in FY2027, which isn't in the data yet. This improves over years, not months. Once all eight portfolios have adopted the program, each new trial year adds 248 held-out nominees. At the 2.2% held-out rate, that is about 5 more band givers. Holding out 62 of each 125 nominees instead of 31 would give about 11 held-out band givers a year and cut the range in half in a little over two years. The cost is 31 fewer contacts per portfolio per year, at about 19 contacts per extra band donor. Whether to give up that outreach for a clearer answer is the station's call.
+- **Yearly giving takes only a few fixed amounts.** Everyone who gave between $1,200 and $1,999 in a year gave exactly $1,200. So last year's total works like a category with a few fixed levels, and many people share the same score. The evaluation metrics must handle those ties. Inside the range, totals pile up on $1,200, $2,000, $5,000 and $10,000. There are a few one-off amounts between $2,000 and $5,100, and none between $10,000 and $25,000. The recommended levels are $1,200-1,999, $2,000-4,999, $5,000-9,999 and $10,000-25,000 (all exactly $10,000). Across FY1984-FY2026 they hold 865, 1,147, 155 and 77 person-years. In FY2026 they hold 63, 55, 4 and 5 of the 127 people in the range. The top two levels are thin, so any result split by level should consider merging them.
+
+## What goes with the target, and is safe to use
+
+- **Last year's level, with $600 as the doorway.** Of people who gave $600-1,199, 12% to 17% reach the $1,200-25,000 range the next year. From $250-599 it's 0.5% to 1.5% (finding 63).
+  - Model 1: the baseline rule is last year's level. The model must do better than that rule.
+  - Model 2: tiers of selection-year giving are the natural subgroups.
+- **Earlier years in the range.** At $600-1,199, people who were in the range in an earlier year are three to six times as likely to be in it again (finding 76). Running history counts are features.
+- **Soft credits make the range.** In FY2026, all 129 people at $1,200 or more have a soft credit, and 122 would fall below $1,200 without it (findings 38, 67). The label counts soft credits, so a credit in year t is a strong input. Model 2 reports the person's own money apart from soft credit.
+- **At the doorway, these facts from the year before go with reaching the range** (findings 81, 82):
+  - Being on the cultivation list (contacted highest). This is Model 2's whole subject.
+  - A credit from `SYN-ORG-DAF` rather than `SYN-ORG-SOFT`. Model 1 counts years with any soft credit and doesn't separate the two.
+  - No monthly payments. Model 1 leaves this out, because payment counts don't continue across the two recording systems.
+- **Demographics don't help once the first-gift year is known.** Age, gender, state, zip and constituent type differ by first-gift year, which the giving record already holds. Among people with the same first-gift year, age, gender, state and type don't differ at the 5% level, and neither do Utah zips within the same era (findings 71 to 75). Leave them out.
+
+## What must stay out
+
+- **Constituent columns restate giving through FY2026** (six of them, finding 12). Never join the memberships table, because it leaks the outcome.
+- **Same-year solicitations, responses, Passport rows and cultivation selection follow that year's giving** (findings 25, 32, 44, 45). From FY2023 on, people who gave are on that year's campaign lists with few exceptions, and a "response" is just a payment. Model 1 inputs stop at year t, with the outcome in t+1. Model 2 leaves the campaign tables out.
+- **Same-year soft credits are part of the target total** (finding 38). A credit in t+1 belongs to the outcome and never to the inputs.
+
+## The trial
+
+- **Cultivation is a randomized experiment.** In FY2022-FY2025, each of eight portfolios nominated 125 donors giving under $1,200 a year. Within each portfolio-year (a stratum), a random draw contacted 94 and held out 31. Both groups gave alike in the selection year (group EDA section 6). Because the draw was random within strata, the model compares contacted and held-out people within the same stratum. This is the stratum fixed-effects estimator.
+- **The gap rests on few people.** In portfolios that had adopted the program, 85 of 1,128 contacted nominees and 8 of 372 held-out nominees were in the range the next year. Model 2 fits one odds ratio and a three-tier table. A causal tree needs more than these eight events.
+- **Portfolios adopted the program in stages.** Whether adoption itself raised the effect is a separate question. Answering it needs year and portfolio fixed effects, and it assumes the order of adoption was as good as random. That assumption is unconfirmed.
+- **The dictionary says the cultivation and officer tables are fictional.** Model 2 shows the method. The station would re-estimate it on real records.
+
+## Two recording systems
+
+- **Legacy records giving through FY2020, and Unite from FY2021.** Yearly totals continue across the switch, but payment counts don't (finding 5), and year-to-year rates at two levels break there (finding 64). Model 1 trains on outcome years FY2001 to FY2026, so it uses both systems. Its inputs are yearly totals and history counts, and history counts can use every year back to FY1984. Payment-count features can't be used. Soft credits start in FY2021, so the one input built from them is 0 in every legacy year.
+- **Planted rows are removed.** These were copied rows in Unite (PR #3) and legacy (PR #4), and 113 soft credits (cleaning). The data still shows an age floor of 18 at the first gift and an FY1999 edge, both left by the data generator (findings 7, 19, 43, 73, 80). Keep both out of the features.
+
+# Data Setup
+
+Before modelling can be completed, we need to engineer some features. The models require a person-year table that combines the unite payments, soft credits, and legacy payments into a single table. For testing, a model fit on earlier years scores each test year, and five cross-validation folds keep each person in one fold.
+
+## The Person-Year Table
+
+```{r person-year-table}
+# Create person year table with total giving and soft credit breakdown
+person_year <- bind_rows(
+  unite_payments |>
+    mutate(fiscal_year = fy(credit_date), amount = payment_amount, source = "own") |>
+    select(constituent_id, fiscal_year, amount, source),
+  soft_credits |>
+    mutate(fiscal_year = fy(credit_date), amount = credit_amount,
+           source = if_else(hard_credit_org_id == "SYN-ORG-DAF", "daf", "sponsor")) |>
+    select(constituent_id, fiscal_year, amount, source),
+  team_approach_legacy_payments |>
+    mutate(constituent_id = constituent_id_1, fiscal_year = fy(gift_date),
+           amount = payment_amount, source = "legacy") |>
+    select(constituent_id, fiscal_year, amount, source)
+) |>
+  filter(!is.na(constituent_id), !str_starts(constituent_id, "SYN-ORG"), amount > 0) |>
+  summarise(total  = sum(amount),
+            credit = sum(amount[source %in% c("daf", "sponsor")]),
+            own    = sum(amount[source == "own"]),
+            daf    = sum(amount[source == "daf"]),
+            .by = c(constituent_id, fiscal_year))
+
+# Show the raw person year table
+person_year |> head() |>
+  arrange(constituent_id, fiscal_year) |>
+  kable(format.args = list(big.mark = ","),
+        caption = "Person-year table, first five rows")
+
+# Givers and in-band givers per fiscal year
+person_year |>
+  filter(fiscal_year >= 2021) |>
+  summarise(givers = n(), in_band = sum(in_band(total)), .by = fiscal_year) |>
+  arrange(fiscal_year) |>
+  mutate(fiscal_year = as.character(fiscal_year)) |>
+  kable(format.args = list(big.mark = ","),
+        caption = "Givers and in-band givers per fiscal year")
+```
+
+## Giving History
+
+```{r giving-history}
+# Create a giving history table with counts of years in band and total giving
+giving_history <- person_year |>
+  arrange(constituent_id, fiscal_year) |>
+  mutate(in_band      = in_band(total),
+         yrs_band     = cumsum(in_band(total)),
+         last_band_fy = cummax(if_else(in_band(total), fiscal_year, 0)),
+         max_before   = lag(cummax(total), default = 0),
+         credit_years = cumsum(fiscal_year >= 2021 & credit > 0),
+         # The number of fiscal years the person has given in so far, counting this one
+         years_given  = row_number(),
+         .by = constituent_id)
+# Sample of the giving history table
+giving_history |> 
+  head() |> 
+  kable(format.args = list(big.mark = ","),
+      caption = "Giving history table with counts of years in band and total giving")
+```
+
+## Panel Data
+
+```{r panel-data}
+# Create the panel: one row per person per starting year, with next year's result attached
+by_year <- c("constituent_id", "fiscal_year")
+panel_all <- giving_history |>
+  filter(between(fiscal_year, 2000, 2025)) |>
+  # Last year's total: move each total forward a year so it lines up with this year
+  left_join(person_year |> mutate(fiscal_year = fiscal_year + 1) |>
+              select(constituent_id, fiscal_year, total_prev = total), by = by_year) |>
+  # Next year's total: move each total back a year
+  left_join(person_year |> mutate(fiscal_year = fiscal_year - 1) |>
+              select(constituent_id, fiscal_year, total_next = total), by = by_year) |>
+  # Officer contact and hold-out flags for this year
+  left_join(cultivation |> mutate(fiscal_year = as.numeric(fiscal_year)) |>
+              select(constituent_id, fiscal_year, contacted, holdout), by = by_year) |>
+  mutate(total_prev = coalesce(total_prev, 0), total_next = coalesce(total_next, 0),
+         contacted = coalesce(contacted, FALSE), holdout = coalesce(holdout, FALSE),
+         outcome_fy = fiscal_year + 1,
+         y = as.integer(in_band(total_next)),
+         level = factor(case_when(total < 250 ~ "$1-249", total < 600 ~ "$250-599",
+                                  total < 1200 ~ "$600-1,199", total <= 25000 ~ "$1,200-25,000",
+                                  .default = "above $25,000"),
+                        levels = c("$1-249", "$250-599", "$600-1,199", "$1,200-25,000", "above $25,000")),
+         never_band = last_band_fy == 0,
+         yrs_since_band = if_else(never_band, 10, pmin(fiscal_year - last_band_fy, 10)),
+         w = if_else(holdout, 125 / 31, 1),
+         untreated = !contacted,
+         # The trial era: starting years from FY2022, when officers first nominated and contacted people
+         trial_era = fiscal_year >= 2022)
+
+# Check: the first nominations are in FY2022
+stopifnot(min(cultivation$fiscal_year) == 2022)
+
+# panel holds the Unite years, FY2021 on, for the tables about recent years
+# panel_all also keeps FY2000 to FY2020, which the pool uses
+panel <- panel_all |> filter(fiscal_year >= 2021)
+
+# Panel rows and band givers by outcome year
+panel |>
+  summarise(all_rows = n(), all_band_givers = sum(y),
+            treated_rows = sum(contacted), treated_band_givers = sum(y[contacted]),
+            untreated_rows = sum(untreated), untreated_band_givers = sum(y[untreated]),
+            .by = outcome_fy) |>
+  arrange(outcome_fy) |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(format.args = list(big.mark = ","),
+        caption = "Panel rows and band givers by outcome year: all, treated and untreated rows")
+```
+
+## The Pool
+
+```{r the-pool}
+# The pool is the rows that can be used for training and testing
+# It keeps rows below $1,200 this year; people already in the band are not who Model 1 ranks
+# It starts at FY2000, not FY2021: nobody was contacted before FY2022, and the earlier years hold most of the crossers
+pool <- panel_all |>
+  filter(total < 1200) |>
+  mutate(level = droplevels(level))
+
+# Check that no pool row is in the band and that three giving levels remain
+stopifnot(!any(pool$in_band), nlevels(pool$level) == 3)
+
+# Pool rows and crossers: the outcome years before the trial together, then each trial year
+# A crosser is a pool row whose person gives in the band the next year
+pool |>
+  mutate(outcome_years = if_else(trial_era, paste0("FY", outcome_fy), "FY2001 to FY2022")) |>
+  summarise(rows = n(), crossers = sum(y), untreated_crossers = sum(y[untreated]),
+            heldout_rows = sum(holdout), heldout_crossers = sum(y[holdout]),
+            not_selected_crossers = sum(y[untreated & !holdout]), .by = outcome_years) |>
+  arrange(outcome_years) |>
+  kable(format.args = list(big.mark = ","), caption = "Pool rows and crossers by outcome year")
+```
+
+**The pool starts at FY2000 to give the model more crossers to learn from.** Starting at FY2021, the pool has `r sum(pool$y[pool$untreated & pool$fiscal_year >= 2021])` untreated crossers. Starting at FY2000, it has `r sum(pool$y[pool$untreated])`. Officers contacted nobody before FY2022, so every earlier row is untreated and has a weight of 1.
+
+## Cross Validation Folds
+
+```{r cross-validation-folds}
+# One label per person from their pool rows; the first label that fits wins, so every fold gets its share of each group
+person_label <- pool |>
+  summarise(label = case_when(any(y == 1 & holdout)    ~ "1 held-out crosser",
+                              any(y == 1 & untreated)  ~ "2 other untreated crosser",
+                              any(y == 1)              ~ "3 contacted crosser",
+                              any(contacted | holdout) ~ "4 nominee, no cross"),
+            .by = constituent_id)
+people <- tibble(constituent_id = sort(unique(person_year$constituent_id), method = "radix")) |>
+  left_join(person_label, by = "constituent_id") |>
+  mutate(label = coalesce(label, "5 everyone else"))
+
+# Draw five stratified folds ten times with caret; a person keeps one fold within a draw
+# Radix sort and a fixed generator make the folds the same on any machine with the same data
+RNGkind("Mersenne-Twister", "Inversion", "Rejection")
+set.seed(seed_val)
+fold_draws <- map(1:10, \(i) mutate(people, draw = i,
+                                    fold = createFolds(factor(label), k = 5, list = FALSE))) |>
+  list_rbind()
+
+# The first draw is the one split every model shares; the other nine show how much the split matters
+folds <- fold_draws |> filter(draw == 1) |> select(constituent_id, fold)
+
+# Check that every person in cultivation has a fold
+stopifnot(all(cultivation$constituent_id %in% folds$constituent_id))
+
+# People per label
+people |>
+  count(label, name = "people") |>
+  kable(format.args = list(big.mark = ","), caption = "People per stratification label")
+
+# Crossers per fold in the shared draw
+pool |>
+  inner_join(folds, by = "constituent_id") |>
+  summarise(untreated_rows = sum(untreated), untreated_crossers = sum(y[untreated]),
+            heldout_crossers = sum(y[holdout]), contacted_crossers = sum(y[contacted]), .by = fold) |>
+  arrange(fold) |>
+  kable(format.args = list(big.mark = ","), caption = "Crossers per fold in the shared draw")
+```
+
+# Model 1
+
+## The Business Idea
+
+Model 1 seeks to rank people who gave under $1,200 this year by their likelihood of giving between $1,200 and $25,000 next year. The station can then contact the top-ranked people to try to move them into the band. The model must do better than the baseline rule of last year's level.
+
+```{r business-idea}
+# Where next year's band givers come from: everyone who has given by a year, by what they gave that year
+first_gift <- person_year |> summarise(first_fy = min(fiscal_year), .by = constituent_id)
+sources <- first_gift |>
+  cross_join(tibble(fiscal_year = 2021:2025)) |>
+  filter(first_fy <= fiscal_year) |>
+  left_join(panel |> select(constituent_id, fiscal_year, level), by = by_year) |>
+  left_join(person_year |> mutate(fiscal_year = fiscal_year - 1) |>
+              select(constituent_id, fiscal_year, total_next = total), by = by_year) |>
+  # A person with no gift that year has no panel row, so they count as lapsed
+  mutate(status = factor(coalesce(as.character(level), "Lapsed"),
+                         levels = c("$1,200-25,000", "$600-1,199", "$250-599", "$1-249", "Lapsed", "above $25,000")),
+         band_next = in_band(coalesce(total_next, 0)))
+
+sources |>
+  summarise(person_years = n(), band_next_year = sum(band_next), .by = status) |>
+  arrange(status) |>
+  mutate(rate_pct = 100 * band_next_year / person_years) |>
+  kable(digits = 3, format.args = list(big.mark = ","),
+        caption = "Next year's band givers by this year's status, starting years FY2021 to FY2025")
+
+# Band givers whose first gift came in the outcome year, so they have no status the year before
+person_year |>
+  filter(between(fiscal_year, 2022, 2026), in_band(total)) |>
+  inner_join(first_gift, by = "constituent_id") |>
+  summarise(band_givers = n(), first_gift_that_year = sum(fiscal_year == first_fy), .by = fiscal_year) |>
+  arrange(fiscal_year) |>
+  mutate(fiscal_year = as.character(fiscal_year)) |>
+  kable(caption = "Band givers by outcome year, and those whose first gift came that year")
+```
+
+## Metrics and the Rule
+
+```{r metrics-and-rule}
+# ROC-AUC by mid-ranks (Mann-Whitney): a tied positive/negative pair counts one half
+roc_auc <- function(score, y) {
+  r <- rank(score)
+  n1 <- sum(y == 1)
+  n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+# Tie groups, highest score first, with where each group starts and the precision at its end
+tie_groups <- function(score, y) {
+  tibble(score, y) |>
+    summarise(n = n(), pos = sum(y), .by = score) |>
+    arrange(desc(score)) |>
+    mutate(start = cumsum(n) - n, precision = cumsum(pos) / cumsum(n))
+}
+# Positives in the top k; the group at the cut counts in proportion to how many of its rows fit
+hits_at <- function(score, y, k) {
+  g <- tie_groups(score, y)
+  sum(g$pos * pmin(pmax(k - g$start, 0), g$n) / g$n)
+}
+# PR-AUC: recall gained by each group times the precision at the end of the group
+pr_auc <- function(score, y) {
+  g <- tie_groups(score, y)
+  sum(g$pos / sum(g$pos) * g$precision)
+}
+# The five numbers reported for one scorer
+score_metrics <- function(score, y) {
+  tibble(roc_auc = roc_auc(score, y), pr_auc = pr_auc(score, y),
+         hits_149 = hits_at(score, y, 149), hits_658 = hits_at(score, y, 658),
+         hits_875 = hits_at(score, y, 875))
+}
+# The five metrics by outcome year for each scorer; scorers is a named vector of score columns
+by_scorer <- function(d, scorers) {
+  map(scorers, \(s) summarise(d, rows = n(), crossers = sum(y), score_metrics(.data[[s]], y),
+                              .by = outcome_fy)) |>
+    list_rbind(names_to = "scorer")
+}
+
+# Check the tie rule on six rows worked by hand: scores 3, 3, 2, 2, 2, 1 with positives first, third and last
+toy_score <- c(3, 3, 2, 2, 2, 1)
+toy_y     <- c(1, 0, 1, 0, 0, 1)
+stopifnot(near(roc_auc(toy_score, toy_y), 3.5 / 9),
+          near(hits_at(toy_score, toy_y, 3), 4 / 3),
+          near(pr_auc(toy_score, toy_y), 14 / 30))
+
+# The rule a fundraiser could run by hand: giving level first, then ever in the band, then this year's total
+pool <- pool |>
+  mutate(level_rank = as.integer(level),
+         rule = level_rank * 1e9 + (yrs_band > 0) * 1e8 + total)
+distinct(pool, level, level_rank) |>
+  arrange(level) |>
+  kable(caption = "The rule ranks people by giving level first")
+```
+
+## Fitting the Model
+
+```{r fitting-the-model}
+# glm finds `w` in `data`; only the expected non-integer-successes warning is muffled
+quiet_glm <- function(formula, data) {
+  withCallingHandlers(
+    glm(formula, family = binomial, data = data, weights = w),
+    warning = \(cnd) if (grepl("non-integer #successes", conditionMessage(cnd))) invokeRestart("muffleWarning"))
+}
+# The seven inputs as before, plus trial_era, which lets the crossing rate differ in the trial years,
+# and years_given, the one input added from the who-responds study
+form <- y ~ level + log1p(total) + log1p(total_prev) + log1p(max_before) +
+  yrs_band + yrs_since_band + credit_years + trial_era + log1p(years_given)
+# Before FY2021 every row has credit_years 0 and trial_era FALSE, so a fit on those years alone leaves both out
+form_early <- update(form, . ~ . - credit_years - trial_era)
+# The same two formulas without years given, to show what the new input adds
+form_without <- update(form, . ~ . - log1p(years_given))
+form_early_without <- update(form_early, . ~ . - log1p(years_given))
+
+# Forward-test scores for any rows and formula: fit on every outcome year before each test year, then score that year
+test_years <- set_names(2024:2026, paste0("FY", 2024:2026))
+forward_score <- function(d, formula, years = test_years) {
+  map(years, \(yr) {
+    fit <- quiet_glm(formula, filter(d, outcome_fy < yr))
+    rows <- filter(d, outcome_fy == yr)
+    mutate(rows, p = predict(fit, rows, type = "response"))
+  }) |>
+    list_rbind()
+}
+
+# Forward test in the trial years: one fit per test year, trained on untreated pool rows
+# with outcomes from FY2001 up to the year before
+fits <- map(test_years, \(yr) quiet_glm(form, filter(pool, untreated, outcome_fy < yr)))
+# Check: the same fits without years given
+without_fits <- map(test_years, \(yr) quiet_glm(form_without, filter(pool, untreated, outcome_fy < yr)))
+# Check: the model as it was before the pool grew, fit on outcomes from FY2022 only, with no trial_era term
+unite_fits <- map(test_years, \(yr) quiet_glm(update(form_without, . ~ . - trial_era),
+                                              filter(pool, untreated, between(outcome_fy, 2022, yr - 1))))
+# Check: the older eight-input model, fit on untreated panel rows of every giving level
+old_fits <- map(test_years, \(yr) quiet_glm(update(form_without, . ~ . - trial_era + never_band),
+                                            filter(panel, untreated, between(outcome_fy, 2022, yr - 1))))
+test <- pool |>
+  filter(untreated, outcome_fy >= 2024) |>
+  mutate(p         = predict(fits[[paste0("FY", first(outcome_fy))]], pick(everything()), type = "response"),
+         p_without = predict(without_fits[[paste0("FY", first(outcome_fy))]], pick(everything()), type = "response"),
+         p_unite   = predict(unite_fits[[paste0("FY", first(outcome_fy))]], pick(everything()), type = "response"),
+         p_old     = predict(old_fits[[paste0("FY", first(outcome_fy))]], pick(everything()), type = "response"),
+         .by = outcome_fy)
+
+# The rule, the model, the model without years given and the two earlier versions, on the same untreated test rows
+forward <- by_scorer(test, c(rule = "rule", model = "p", without_years_given = "p_without",
+                             unite_years_model = "p_unite", old_model = "p_old"))
+forward |>
+  arrange(outcome_fy) |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = 3, format.args = list(big.mark = ","),
+        caption = "Forward test on untreated pool rows: the rule, the model, the model without years given, the Unite-years model and the older model")
+
+# What each test year's fit learned from, next to the Unite-years fit
+map2(fits, unite_fits, \(all_years, unite) tibble(training_rows = nobs(all_years), training_crossers = sum(all_years$y),
+                                                  unite_years_rows = nobs(unite), unite_years_crossers = sum(unite$y))) |>
+  list_rbind(names_to = "test_year") |>
+  kable(format.args = list(big.mark = ","),
+        caption = "Training rows and crossers behind each test year's fit, for the model and the Unite-years model")
+```
+
+## The Earlier Test Years
+
+```{r earlier-test-years}
+# Forward test before the trial: outcome years FY2011 to FY2022, each scored by a fit on every earlier outcome year
+# Nobody was contacted in those years, so every pool row is untreated and in the test
+early_test <- forward_score(filter(pool, !trial_era), form_early, 2011:2022) |>
+  # The same rows scored without years given
+  inner_join(forward_score(filter(pool, !trial_era), form_early_without, 2011:2022) |>
+               select(constituent_id, fiscal_year, p_without = p), by = by_year)
+early <- by_scorer(early_test, c(rule = "rule", model = "p", without_years_given = "p_without"))
+
+# The rule and the model side by side for each test year
+early_wide <- early |>
+  filter(scorer != "without_years_given") |>
+  select(scorer, outcome_fy, crossers, roc_auc, pr_auc, hits_149, hits_658) |>
+  pivot_wider(names_from = scorer, values_from = c(roc_auc, pr_auc, hits_149, hits_658),
+              names_glue = "{scorer}_{.value}") |>
+  arrange(outcome_fy)
+early_wide |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = c(0, 0, 3, 3, 3, 3, 1, 1, 1, 1),
+        caption = "Forward test before the trial: the rule and the model by test year")
+
+# The twelve test years together
+early_totals <- early |>
+  summarise(years = n(), crossers = sum(crossers), hits_149 = sum(hits_149), hits_658 = sum(hits_658),
+            hits_875 = sum(hits_875), mean_roc_auc = mean(roc_auc), mean_pr_auc = mean(pr_auc), .by = scorer)
+kable(early_totals, digits = c(0, 0, 0, 1, 1, 1, 3, 3),
+      caption = "The twelve test years before the trial together")
+early_model <- filter(early_totals, scorer == "model")
+early_rule <- filter(early_totals, scorer == "rule")
+early_without <- filter(early_totals, scorer == "without_years_given")
+# The test years in which years given raised the model's PR-AUC
+pr_auc_by_year <- early |>
+  select(scorer, outcome_fy, pr_auc) |>
+  pivot_wider(names_from = scorer, values_from = pr_auc)
+years_given_wins <- sum(pr_auc_by_year$model > pr_auc_by_year$without_years_given)
+```
+
+**Twelve more test years show the model a little ahead of the rule, on far more crossers.** The twelve years from FY2011 to FY2022 have `r early_model$crossers` crossers. The three trial test years have `r sum(test$y)` untreated crossers. Taking the top 149 names in each of the twelve years, the model's lists held `r round(early_model$hits_149)` of the `r early_model$crossers` crossers and the rule's held `r round(early_rule$hits_149)`. With the top 658 names it was `r round(early_model$hits_658)` and `r round(early_rule$hits_658)`. The model's PR-AUC was higher than the rule's in `r sum(early_wide$model_pr_auc > early_wide$rule_pr_auc)` of the 12 years. So the model is ahead of the rule, but only by about `r round(early_model$hits_658 - early_rule$hits_658)` crossers over the twelve years in the top 658 names.
+
+**Years given adds a little to the ranking.** `years_given` counts the fiscal years in which a person has given so far. Without it, the model's top 149 names held `r round(early_without$hits_149)` of the `r early_without$crossers` crossers. With it they held `r round(early_model$hits_149)`. The model's PR-AUC was higher with it in `r years_given_wins` of the 12 years. It was picked after twelve traits from a separate study of who responds to contact were tried as inputs, outside this notebook. So treat the size of the gain as a best case.
+
+## Cross Validation
+
+```{r cross-validation}
+# One draw: fit on the untreated pool rows of four folds, then score every pool row in the fifth
+cv_draw <- function(fold_table) {
+  d <- inner_join(pool, fold_table, by = "constituent_id")
+  cv_fits <- map(1:5, \(k) quiet_glm(form, filter(d, untreated, fold != k)))
+  mutate(d, p_cv = predict(cv_fits[[first(fold)]], pick(everything()), type = "response"), .by = fold)
+}
+# ROC-AUC and PR-AUC for the rule and the model
+auc_scores <- function(d, by = NULL) {
+  summarise(d, rows = n(), crossers = sum(y),
+            rule_roc_auc = roc_auc(rule, y), model_roc_auc = roc_auc(p_cv, y),
+            rule_pr_auc = pr_auc(rule, y), model_pr_auc = pr_auc(p_cv, y), .by = {{ by }})
+}
+
+# The shared draw gives every pool row one out-of-fold score; later steps reuse p_cv
+pool_cv <- cv_draw(folds)
+cv_test <- filter(pool_cv, untreated)
+
+# All ten draws: score the rule and the model inside each fold, on untreated rows
+fold_scores <- map(1:10, \(i) fold_draws |>
+                     filter(draw == i) |>
+                     select(constituent_id, fold) |>
+                     cv_draw() |>
+                     filter(untreated) |>
+                     auc_scores(fold)) |>
+  list_rbind(names_to = "draw")
+
+# Scores by fold in the shared draw
+fold_scores |>
+  filter(draw == 1) |>
+  select(-draw) |>
+  arrange(fold) |>
+  kable(digits = 3, format.args = list(big.mark = ","),
+        caption = "Out-of-fold scores by fold in the shared draw, untreated pool rows")
+
+# Headline: the mean of the 50 fold scores, with the lowest and highest draw; the pooled score is a check
+fold_scores |>
+  pivot_longer(ends_with("auc"), names_to = "measure") |>
+  summarise(draw_mean = mean(value), .by = c(measure, draw)) |>
+  summarise(mean_of_50_folds = mean(draw_mean), lowest_draw = min(draw_mean),
+            highest_draw = max(draw_mean), .by = measure) |>
+  left_join(auc_scores(cv_test) |>
+              pivot_longer(ends_with("auc"), names_to = "measure", values_to = "pooled_shared_draw") |>
+              select(measure, pooled_shared_draw), by = "measure") |>
+  kable(digits = 3,
+        caption = paste0("Cross-validated scores over ten draws of five folds; a ranking with no skill has PR-AUC ",
+                         round(mean(cv_test$y), 5)))
+
+# The five metrics by outcome year from FY2022, from the shared draw's out-of-fold scores
+cv_by_year <- by_scorer(filter(cv_test, outcome_fy >= 2022), c(rule = "rule", model = "p_cv"))
+cv_by_year |>
+  arrange(outcome_fy) |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = 3, format.args = list(big.mark = ","),
+        caption = "Out-of-fold results by outcome year from FY2022, shared draw, untreated pool rows")
+
+# The model on the same test years: forward test next to cross-validation
+forward |>
+  filter(scorer == "model") |>
+  select(outcome_fy, forward_roc_auc = roc_auc, forward_pr_auc = pr_auc) |>
+  left_join(cv_by_year |> filter(scorer == "model") |>
+              select(outcome_fy, cv_roc_auc = roc_auc, cv_pr_auc = pr_auc), by = "outcome_fy") |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = 3, caption = "The model on the same test years: forward test and cross-validation")
+```
+
+## Calibration and Sorting in the 600 level
+
+```{r calibration-and-sorting}
+# Calibration: crossers the forward-test scores expect against crossers seen, by test year
+# The weighted counts let the 31 held-out nominees in a stratum stand for all 125; before the trial every weight is 1
+# FY2023 has no forward-test score, because no earlier outcome year could set the trial_era term
+calibration <- bind_rows(early_test, test) |>
+  summarise(expected = sum(w * p), observed = sum(w * y),
+            expected_unweighted = sum(p), observed_unweighted = sum(y), .by = outcome_fy) |>
+  arrange(outcome_fy)
+calibration |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = 1, caption = "Expected and observed crossers on untreated pool rows, forward test")
+
+# Why the model has a trial_era term: a fit on the years before the trial, carried into the trial years
+pre_trial_fit <- quiet_glm(form_early, filter(pool, !trial_era))
+trial_level <- pool |>
+  filter(untreated, trial_era) |>
+  mutate(p = predict(pre_trial_fit, pick(everything()), type = "response")) |>
+  summarise(expected = sum(w * p), observed = sum(w * y), .by = outcome_fy) |>
+  arrange(outcome_fy)
+trial_level |>
+  mutate(observed_over_expected = observed / expected, outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = c(0, 1, 1, 2),
+        caption = "Untreated pool rows in the trial years: crossers expected at the rate of the earlier years, and observed")
+
+# Sorting: split the untreated $600-1,199 rows into thirds by score and count the crossers in each
+# Score cut points keep people with equal scores in the same third, so the thirds differ a little in size
+thirds <- function(d, score) {
+  d |>
+    filter(level == "$600-1,199") |>
+    mutate(third = cut({{ score }}, quantile({{ score }}, 0:3 / 3), include.lowest = TRUE,
+                       labels = c("Lowest", "Middle", "Highest"))) |>
+    summarise(rows = n(), crossers = sum(y), rate_pct = 100 * mean(y),
+              not_selected_rows = sum(!holdout), not_selected_crossers = sum(y[!holdout]), .by = third) |>
+    arrange(third)
+}
+# The years before the trial are kept apart from the trial years, because trial_era moves every trial-year score down
+thirds(filter(cv_test, !trial_era), p_cv) |>
+  select(-starts_with("not_selected")) |>
+  kable(digits = 1, format.args = list(big.mark = ","),
+        caption = "Crossers by third of out-of-fold score, rows at $600-1,199, starting years FY2000 to FY2021")
+thirds(test, p) |>
+  kable(digits = 1, caption = "Crossers by third of forward-test score, untreated rows at $600-1,199, FY2024 to FY2026")
+
+# Calibration by years given, in the forward test before the trial: crossers seen, and expected with and without the new input
+by_years_given <- early_test |>
+  mutate(years_given = cut(years_given, c(0, 3, 7, 14, Inf), labels = c("1 to 3", "4 to 7", "8 to 14", "15 or more"))) |>
+  summarise(rows = n(), crossers = sum(y), expected = sum(p), expected_without_years_given = sum(p_without),
+            .by = years_given) |>
+  arrange(years_given)
+kable(by_years_given, digits = c(0, 0, 0, 1, 1), format.args = list(big.mark = ","),
+      caption = "Crossers seen and expected by years given, forward test before the trial")
+# Rows the text quotes: people who have given in 8 or more years, and in 3 or fewer
+given_8_plus <- filter(by_years_given, years_given %in% c("8 to 14", "15 or more"))
+given_1_to_3 <- filter(by_years_given, years_given == "1 to 3")
+```
+
+**The crossing rate holds across the change of recording system, then drops in the trial years.** For outcome years FY2021 and FY2022, the first two in Unite, the forward test expected `r round(calibration$expected[calibration$outcome_fy == 2021])` and `r round(calibration$expected[calibration$outcome_fy == 2022])` crossers, and `r calibration$observed[calibration$outcome_fy == 2021]` and `r calibration$observed[calibration$outcome_fy == 2022]` occurred. In the trial years, people who weren't contacted crossed less often than the earlier years predict. At the rate of the earlier years, the model expects `r round(sum(trial_level$expected))` untreated crossers from FY2023 to FY2026, counting each held-out nominee as 125/31 people. Only `r round(sum(trial_level$observed))` occurred. The `trial_era` term lets the model use the lower rate of the trial years. In FY2026 the rate was back where it was before the trial, so the FY2027 list is shown both ways.
+
+**Years given narrows the miscount of long-time and newer givers.** In the twelve test years before the trial, `r sum(given_8_plus$crossers)` crossers had given in 8 or more years. Without `years_given` the model expected `r round(sum(given_8_plus$expected_without_years_given))` of them. With it, the model expected `r round(sum(given_8_plus$expected))`. People with 3 or fewer giving years had `r given_1_to_3$crossers` crossers. The model expected `r round(given_1_to_3$expected_without_years_given)` without it and `r round(given_1_to_3$expected)` with it.
+
+## The Three Views
+
+```{r three-views}
+# View A is the main forward test; view B adds contacted people, every row weighted 1; view C keeps rows officers did not pick
+# forward_score comes from Fitting the Model, so view B also trains on every outcome year from FY2001
+view_b <- mutate(pool, w = 1)
+views <- bind_rows("A. Untreated rows"                  = test,
+                   "B. All rows, no contacted term"     = forward_score(view_b, form),
+                   "B. All rows, with a contacted term" = forward_score(view_b, update(form, . ~ . + contacted)),
+                   "C. Not selected for cultivation"    = filter(test, !holdout),
+                   .id = "view")
+views |>
+  summarise(rows = n(), crossers = sum(y),
+            rule_roc_auc = roc_auc(rule, y), model_roc_auc = roc_auc(p, y),
+            rule_hits_149 = hits_at(rule, y, 149), model_hits_149 = hits_at(p, y, 149),
+            .by = c(view, outcome_fy)) |>
+  arrange(view, outcome_fy) |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = 3, format.args = list(big.mark = ","),
+        caption = "The rule and the model in three views, by test year")
+
+# Who fills the model's top 149 in view A: held-out nominees and the crossers among them
+# Scores tie at the cut, so hits_at shares the tied group in proportion, the same rule as the metrics
+test |>
+  summarise(crossers = hits_at(p, y, 149), heldout_names = hits_at(p, holdout, 149),
+            heldout_crossers = hits_at(p, y & holdout, 149), .by = outcome_fy) |>
+  arrange(outcome_fy) |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = 1, caption = "The model's top 149 untreated names by test year, and the held-out nominees among them")
+```
+
+## Conclusions
+
+```{r band-flow}
+# The band's flow by outcome year: the people in the band the year before, and how many stayed, left and entered
+# left counts everyone no longer in the band, including anyone who gave more than $25,000
+band_flow <- panel |>
+  filter(level == "$1,200-25,000") |>
+  summarise(in_band_year_before = n(), stayed = sum(y), .by = outcome_fy) |>
+  left_join(person_year |> filter(in_band(total)) |> count(outcome_fy = fiscal_year, name = "in_band_outcome_year"),
+            by = "outcome_fy") |>
+  mutate(left = in_band_year_before - stayed, entered = in_band_outcome_year - stayed) |>
+  arrange(outcome_fy)
+
+# Check: each outcome year's band count is the next row's count for the year before
+stopifnot(all(head(band_flow$in_band_outcome_year, -1) == tail(band_flow$in_band_year_before, -1)))
+
+band_flow |>
+  select(outcome_fy, in_band_year_before, stayed, left, entered, in_band_outcome_year) |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(caption = "People in the band by outcome year: how many stayed, left and entered")
+```
+
+**The band loses about as many people as it gains.** From FY2021 to FY2025 the band had `r sum(band_flow$in_band_year_before)` givers, counting a person once for each year in the band. The next year, `r sum(band_flow$stayed)` of them gave in the band again and `r sum(band_flow$left)` didn't. Over the same years, `r sum(band_flow$entered)` other people moved into the band. The band ended at `r last(band_flow$in_band_outcome_year)` people in FY2026, up from `r first(band_flow$in_band_year_before)` in FY2021. Model 1 ranks only the people who might move in. It doesn't cover the people who leave.
+
+```{r band-moves}
+# Moves across the band line for each person in the band at least once from FY2021 to FY2026
+# A year with no gift counts as out of the band; a move is in the band one year and out the next, or the reverse
+band_years <- giving_history |>
+  filter(between(fiscal_year, 2021, 2026), in_band) |>
+  select(constituent_id, fiscal_year, in_band, yrs_band)
+band_moves <- distinct(band_years, constituent_id) |>
+  cross_join(tibble(fiscal_year = 2021:2026)) |>
+  left_join(band_years, by = by_year) |>
+  mutate(in_band = coalesce(in_band, FALSE)) |>
+  arrange(constituent_id, fiscal_year) |>
+  # An entry is a return when the person was in the band in an earlier year, counting every year back to FY1984
+  summarise(years_in_band = sum(in_band),
+            entries = sum(in_band & !lag(in_band), na.rm = TRUE),
+            returns = sum(in_band & !lag(in_band) & yrs_band > 1, na.rm = TRUE),
+            exits   = sum(!in_band & lag(in_band), na.rm = TRUE), .by = constituent_id) |>
+  mutate(moves = entries + exits)
+
+# Check: the moves add up to the entries and exits in the flow table
+stopifnot(sum(band_moves$entries) == sum(band_flow$entered), sum(band_moves$exits) == sum(band_flow$left))
+
+band_moves |>
+  summarise(people = n(), moves_made = sum(moves), .by = moves) |>
+  arrange(moves) |>
+  kable(caption = "People in the band at least once from FY2021 to FY2026, by how many times they moved in or out")
+```
+
+**Few people go back and forth across the band line.** From FY2021 to FY2026, `r sum(band_moves$moves > 0)` people moved into or out of the band. Only `r sum(band_moves$moves >= 3)` of them moved three or more times, and they made `r with(band_moves, sum(moves[moves >= 3]))` of the `r sum(band_moves$moves)` moves. That count is a floor, because six years show at most five moves. Another `r with(band_moves, sum(moves == 2 & years_in_band == 1))` people came in for one year and were out the next. Even so, `r sum(band_moves$returns)` of the `r sum(band_moves$entries)` entries came from someone who had been in the band in an earlier year, counting every year back to FY1984. The rule and the model both use that history.
+
+# Model 2
+
+## Trial Rows
+
+```{r trial-rows}
+# One row per nomination, with the person's total in the selection year and in the year after
+# A person with no gift in a year has no person-year row, so that total is 0
+trial <- cultivation |>
+  left_join(person_year |> select(constituent_id, fiscal_year, sel_total = total), by = by_year) |>
+  left_join(person_year |> mutate(fiscal_year = fiscal_year - 1) |>
+              select(constituent_id, fiscal_year, next_total = total), by = by_year) |>
+  mutate(sel_total = coalesce(sel_total, 0), next_total = coalesce(next_total, 0),
+         y = as.integer(in_band(next_total)),
+         contacted = as.integer(contacted),
+         tier = factor(case_when(sel_total < 250 ~ "$1-249", sel_total < 600 ~ "$250-599",
+                                 .default = "$600-1,199")),
+         # A stratum is one portfolio in one selection year; contact was drawn at random inside it
+         portfolio_year = paste(portfolio_id, fiscal_year))
+# Effects are estimated on the portfolios that had adopted the program
+adopted <- filter(trial, program_adopted)
+
+# Check the design: every stratum has 125 nominations, and each of the 12 adopted strata has 94 contacted
+stopifnot(all(count(trial, portfolio_year)$n == 125), nrow(adopted) == 1500,
+          n_distinct(adopted$portfolio_year) == 12, all(count(adopted, portfolio_year, wt = contacted)$n == 94))
+
+# All nominations next to the adopted ones
+bind_rows("All nominations" = trial, "Adopted portfolios" = adopted, .id = "nominations") |>
+  summarise(rows = n(), strata = n_distinct(portfolio_year), people = n_distinct(constituent_id),
+            contacted = sum(contacted), held_out = sum(holdout), largest_selection_total = max(sel_total),
+            gave_nothing_in_selection_year = sum(sel_total == 0), .by = nominations) |>
+  kable(format.args = list(big.mark = ","), caption = "Nominations in the trial, and in portfolios that had adopted the program")
+
+# The selection years in which each portfolio had adopted the program
+trial |>
+  summarise(adopted_selection_years = if (any(program_adopted)) paste0("FY", sort(unique(fiscal_year[program_adopted])), collapse = ", ") else "none",
+            .by = portfolio_id) |>
+  arrange(portfolio_id) |>
+  kable(caption = "Adopted selection years by portfolio")
+```
+
+## Tier Table
+
+```{r tier-table}
+# Wilson interval for one share, and Newcombe's interval for a difference of two shares
+wilson <- function(events, n, z = qnorm(0.975)) {
+  p <- events / n
+  centre <- (p + z^2 / (2 * n)) / (1 + z^2 / n)
+  half <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / (1 + z^2 / n)
+  c(centre - half, centre + half)
+}
+newcombe <- function(e1, n1, e0, n0) {
+  p1 <- e1 / n1; p0 <- e0 / n0
+  w1 <- wilson(e1, n1); w0 <- wilson(e0, n0)
+  c(p1 - p0 - sqrt((p1 - w1[1])^2 + (w0[2] - p0)^2),
+    p1 - p0 + sqrt((w1[2] - p1)^2 + (p0 - w0[1])^2))
+}
+# Band givers by arm for one set of nominations, with the effect of contact in points and its Newcombe interval
+arm_effect <- function(d) {
+  d |>
+    summarise(held_events = sum(y[contacted == 0]), held_n = sum(contacted == 0),
+              contacted_events = sum(y[contacted == 1]), contacted_n = sum(contacted == 1)) |>
+    mutate(effect = 100 * (contacted_events / contacted_n - held_events / held_n),
+           low  = 100 * newcombe(contacted_events, contacted_n, held_events, held_n)[1],
+           high = 100 * newcombe(contacted_events, contacted_n, held_events, held_n)[2])
+}
+# The two arms as text for a table, such as "8 of 372"
+arm_text <- function(events, n) paste(events, "of", prettyNum(n, big.mark = ","))
+
+# The headline table: band givers next year by tier, with the contacts it takes to add one band donor
+tier_table <- bind_rows(adopted, mutate(adopted, tier = "All")) |>
+  summarise(arm_effect(pick(everything())), .by = tier) |>
+  arrange(tier)
+
+# Check the counts every later step rests on: 8 of 372 held out and 85 of 1,128 contacted
+stopifnot(with(filter(tier_table, tier == "All"),
+               held_events == 8 & held_n == 372 & contacted_events == 85 & contacted_n == 1128))
+
+tier_table |>
+  transmute(tier, held_out = arm_text(held_events, held_n), contacted = arm_text(contacted_events, contacted_n),
+            effect, low, high, contacts_per_extra_donor = 100 / effect) |>
+  kable(digits = 1, caption = "Band givers next year by tier in adopted strata, with the effect of contact in points")
+```
+
+## Headline Effect
+
+```{r headline-effect}
+# Linear regression of the band label on contact, with stratum fixed effects and standard errors clustered by person
+# se_type is written out because the default differs across estimatr versions
+headline <- lm_robust(y ~ contacted, data = adopted, fixed_effects = ~portfolio_year,
+                      clusters = constituent_id, se_type = "CR2")
+tidy(headline) |>
+  select(term, estimate, std.error, conf.low, conf.high, p.value) |>
+  mutate(p.value = format.pval(p.value, digits = 2)) |>
+  kable(digits = 4, caption = "Effect of contact on band giving: linear probability model with stratum fixed effects")
+
+# Exact randomization test: if contact does nothing, each stratum's held-out band count is hypergeometric,
+# and the total over the 12 strata is the convolution of those counts
+null_dist <- adopted |>
+  summarise(N = n(), K = sum(y), n_held = sum(contacted == 0), .by = portfolio_year) |>
+  pmap(\(portfolio_year, N, K, n_held) dhyper(0:n_held, K, N - K, n_held)) |>
+  reduce(\(a, b) convolve(a, rev(b), type = "open"))
+held_count <- seq_along(null_dist) - 1
+n_contacted <- sum(adopted$contacted == 1)
+n_held <- sum(adopted$contacted == 0)
+# The effect in the data if the held-out arm had a given number of band givers
+effect_if <- function(held) (sum(adopted$y) - held) / n_contacted - held / n_held
+observed_effect <- effect_if(sum(adopted$y[adopted$contacted == 0]))
+# The chance of an effect at least as far from zero as the observed one
+randomization_p <- sum(null_dist[abs(effect_if(held_count)) >= abs(observed_effect) - 1e-12])
+tibble(effect_points = 100 * observed_effect, randomization_p) |>
+  kable(digits = c(2, 5), caption = "Raw effect of contact in points, and its exact randomization p-value")
+```
+
+## Other Outcomes
+
+```{r other-outcomes}
+# More outcomes for the same nominations: the person's own money, and the total two years after selection
+# Dollar outcomes count next year's total up to a cap, so a few very large totals can't set the result
+dollar_cap <- 2500
+cap_text <- scales::dollar(dollar_cap)
+outcomes <- adopted |>
+  left_join(person_year |> select(constituent_id, fiscal_year, sel_own = own), by = by_year) |>
+  left_join(person_year |> mutate(fiscal_year = fiscal_year - 1) |>
+              select(constituent_id, fiscal_year, next_own = own), by = by_year) |>
+  left_join(person_year |> mutate(fiscal_year = fiscal_year - 2) |>
+              select(constituent_id, fiscal_year, total_in_two_years = total), by = by_year) |>
+  mutate(across(c(sel_own, next_own, total_in_two_years), \(v) coalesce(v, 0)),
+         at_least_600         = as.integer(next_total >= 600),
+         gave_less            = as.integer(next_total < sel_total),
+         gave_nothing         = as.integer(next_total == 0),
+         dollar_change        = pmin(next_total, dollar_cap) - sel_total,
+         own_dollar_change    = pmin(next_own, dollar_cap) - sel_own,
+         dollar_change_no_cap = next_total - sel_total,
+         band_in_two_years    = as.integer(in_band(total_in_two_years)))
+# The year after next is in the data only for selection years FY2023 and FY2024
+two_year <- filter(outcomes, fiscal_year <= 2024)
+
+# The headline regression for any outcome column; scale = 100 turns a share into points
+outcome_effect <- function(d, column, label, scale = 1) {
+  fit <- lm_robust(reformulate("contacted", response = column), data = d, fixed_effects = ~portfolio_year,
+                   clusters = constituent_id, se_type = "CR2")
+  held_out_average <- scale * mean(d[[column]][d$contacted == 0])
+  tidy(fit) |>
+    filter(term == "contacted") |>
+    transmute(outcome = label, rows = nrow(d), held_out_average, effect = scale * estimate,
+              low = scale * conf.low, high = scale * conf.high)
+}
+other_outcomes <- bind_rows(
+  band              = outcome_effect(outcomes, "y", "In the band next year, points", 100),
+  at_least_600      = outcome_effect(outcomes, "at_least_600", "Gave $600 or more next year, points", 100),
+  gave_less         = outcome_effect(outcomes, "gave_less", "Gave less than in the selection year, or nothing, points", 100),
+  gave_nothing      = outcome_effect(outcomes, "gave_nothing", "Gave nothing next year, points", 100),
+  dollars           = outcome_effect(outcomes, "dollar_change", paste("Change in dollars, next year's total capped at", cap_text)),
+  own_dollars       = outcome_effect(outcomes, "own_dollar_change", paste("Change in own money, capped at", cap_text)),
+  dollars_no_cap    = outcome_effect(outcomes, "dollar_change_no_cap", "Change in dollars, no cap"),
+  band_first_year   = outcome_effect(two_year, "y", "In the band next year, selection years FY2023 and FY2024, points", 100),
+  band_in_two_years = outcome_effect(two_year, "band_in_two_years", "In the band two years out, the same nominations, points", 100),
+  .id = "key")
+
+# Check: the first row is the headline effect
+stopifnot(near(other_outcomes$effect[1], 100 * coef(headline)[["contacted"]]))
+
+other_outcomes |>
+  select(-key) |>
+  kable(digits = 1, format.args = list(big.mark = ","),
+        caption = "Effect of contact on other outcomes: the headline regression, one outcome at a time")
+# One row of the table by its key, for the text
+outcome_row <- function(k) filter(other_outcomes, key == k)
+```
+
+**Contact shows no sign of harm, and the gain is clearer on a wider target.** Contacted nominees were `r round(outcome_row("at_least_600")$effect, 1)` points more likely to give $600 or more the next year, with a 95% range of `r round(outcome_row("at_least_600")$low, 1)` to `r round(outcome_row("at_least_600")$high, 1)`. That result rests on `r sum(outcomes$at_least_600[outcomes$contacted == 0])` held-out givers, where the band result rests on `r sum(outcomes$y[outcomes$contacted == 0])`. Contact didn't lead more people to give less. The share who gave less than in the selection year, or nothing, moved by `r round(outcome_row("gave_less")$effect, 1)` points, and the share who gave nothing by `r round(outcome_row("gave_nothing")$effect, 1)`. Both ranges include zero.
+
+## One Odds Ratio
+
+```{r one-odds-ratio}
+# One odds ratio for contact: logistic regression with tier and stratum held fixed
+or_fit <- glm(y ~ contacted + tier + factor(portfolio_year), family = binomial, data = adopted)
+# The same model as Poisson gives the risk ratio
+rr_fit <- glm(y ~ contacted + tier + factor(portfolio_year), family = poisson, data = adopted)
+# Sensitivity: the label "$1,200 or more", with no $25,000 upper cap
+nocap_fit <- glm(as.integer(next_total >= 1200) ~ contacted + tier + factor(portfolio_year),
+                 family = binomial, data = adopted)
+
+# Covariance clustered by person; type = "HC1" is written out because vcovCL defaults to HC0 for a glm fit
+person_vcov <- function(fit) vcovCL(fit, cluster = ~constituent_id, type = "HC1")
+# One coefficient of a fit as a ratio, with its 95% interval and p-value
+ratio_row <- function(fit, label, term = "contacted") {
+  ct <- coeftest(fit, vcov. = person_vcov(fit))[term, ]
+  tibble(ratio = label, estimate = exp(ct[[1]]), low = exp(ct[[1]] - qnorm(0.975) * ct[[2]]),
+         high = exp(ct[[1]] + qnorm(0.975) * ct[[2]]), p = ct[[4]])
+}
+bind_rows(ratio_row(or_fit, "Odds ratio"), ratio_row(rr_fit, "Risk ratio"),
+          ratio_row(nocap_fit, "Odds ratio, no upper cap")) |>
+  kable(digits = c(0, 2, 2, 2, 4), format.args = list(scientific = FALSE),
+        caption = "Effect of contact as a ratio, with intervals clustered by person")
+
+# The nominees the upper cap matters for: above $25,000 the next year
+adopted |>
+  filter(next_total > 25000) |>
+  transmute(tier, arm = if_else(contacted == 1, "Contacted", "Held out"), sel_total, next_total) |>
+  kable(format.args = list(big.mark = ","), caption = "Adopted nominees who gave more than $25,000 the next year")
+
+# The odds ratio turned back into points, by tier and overall
+or_vcov <- person_vcov(or_fit)
+bind_rows(as_tibble(avg_comparisons(or_fit, variables = "contacted", by = "tier", vcov = or_vcov)) |>
+            select(tier, estimate, conf.low, conf.high),
+          as_tibble(avg_comparisons(or_fit, variables = "contacted", vcov = or_vcov)) |>
+            transmute(tier = "All", estimate, conf.low, conf.high)) |>
+  mutate(across(-tier, \(v) 100 * v)) |>
+  kable(digits = 1, caption = "Effect of contact in points implied by one odds ratio")
+```
+
+## Uplift
+
+```{r uplift}
+# The gain from contact for a person with base chance p0: one odds ratio applied to that chance
+log_odds_ratio <- coef(or_fit)[["contacted"]]
+uplift <- function(p0, log_or) plogis(qlogis(p0) + log_or) - p0
+# Above this base chance the gain gets smaller again
+turning_point <- 1 / (1 + exp(log_odds_ratio / 2))
+
+tibble(p0 = c(0.005, 0.02, 0.05, 0.088)) |>
+  mutate(uplift_points = 100 * uplift(p0, log_odds_ratio),
+         contacts_per_extra_donor = 1 / uplift(p0, log_odds_ratio),
+         p0 = paste0(100 * p0, "%")) |>
+  kable(digits = 1, caption = paste0("Uplift from one odds ratio at different base chances; uplift peaks at a base chance of ",
+                                     round(100 * turning_point, 1), "%"))
+```
+
+## Former Band Givers
+
+```{r former-band-givers}
+# The last year each nominee was in the band before the selection year, if any
+# Built from person_year, so it also covers the nominee who gave nothing in the selection year
+adopted <- adopted |>
+  left_join(person_year |> filter(in_band(total)) |> select(constituent_id, last_band_fy = fiscal_year),
+            by = join_by(constituent_id, closest(fiscal_year > last_band_fy))) |>
+  mutate(ever_band = !is.na(last_band_fy), left_recent = ever_band & fiscal_year - last_band_fy <= 2)
+
+# The nominations in four groups by band history; the last group is part of the second
+band_groups <- bind_rows("All nominees" = adopted, "Ever in the band" = filter(adopted, ever_band),
+                         "Never in the band" = filter(adopted, !ever_band),
+                         "Left 1 to 2 years ago" = filter(adopted, left_recent), .id = "group")
+band_groups |>
+  summarise(rows = n(), people = n_distinct(constituent_id), .by = group) |>
+  kable(format.args = list(big.mark = ","), caption = "Adopted nominations by band history before the selection year")
+
+# The effect of contact by band history: the effect in points, the raw odds ratio from the four cells,
+# and the gain one odds ratio predicts at the group's held-out share
+band_table <- band_groups |>
+  summarise(arm_effect(pick(everything())), .by = group) |>
+  mutate(log_or = log((contacted_events / (contacted_n - contacted_events)) / (held_events / (held_n - held_events))),
+         se = sqrt(1 / contacted_events + 1 / (contacted_n - contacted_events) + 1 / held_events + 1 / (held_n - held_events)),
+         odds_ratio = exp(log_or), or_low = exp(log_or - qnorm(0.975) * se), or_high = exp(log_or + qnorm(0.975) * se),
+         one_multiplier_predicts = 100 * uplift(held_events / held_n, log_odds_ratio))
+
+# Check: the ever and never rows add up to the row for all nominees
+stopifnot(sum(band_table$contacted_n[2:3]) == band_table$contacted_n[1], sum(band_table$held_n[2:3]) == band_table$held_n[1],
+          sum(band_table$contacted_events[2:3]) == 85, sum(band_table$held_events[2:3]) == 8)
+
+band_table |>
+  transmute(group, contacted = arm_text(contacted_events, contacted_n), held_out = arm_text(held_events, held_n),
+            effect, low, high, odds_ratio, or_low, or_high, one_multiplier_predicts) |>
+  kable(digits = c(0, 0, 0, 1, 1, 1, 2, 2, 2, 2),
+        caption = "Effect of contact by band history: points, the raw odds ratio, and the points one odds ratio predicts")
+
+# Does the odds ratio differ for former band givers? Contact by band history, with tier and stratum held fixed
+band_fit <- glm(y ~ contacted * ever_band + tier + factor(portfolio_year), family = binomial, data = adopted)
+bind_rows(ratio_row(band_fit, "Ratio of odds ratios, ever against never in the band", "contacted:ever_bandTRUE"),
+          ratio_row(band_fit, "Odds ratio for people never in the band")) |>
+  kable(digits = c(0, 2, 2, 2, 2), caption = "Test of a different odds ratio for former band givers, clustered by person")
+```
+
+## The Scale Row
+
+```{r scale-row}
+# The adopted nominations that have a base chance: Model 1's out-of-fold score for the same person and year
+scale_rows <- adopted |> inner_join(select(pool_cv, constituent_id, fiscal_year, p0 = p_cv), by = by_year)
+# Check: only the nominee who gave nothing in the selection year has no pool row, so no base chance
+stopifnot(nrow(scale_rows) == nrow(adopted) - sum(adopted$sel_total == 0))
+
+# The odds ratio with tier held fixed, as in the current rule, and with the base chance held fixed in its place
+tier_fit <- update(or_fit, data = scale_rows)
+offset_fit <- glm(y ~ contacted + factor(portfolio_year) + offset(qlogis(p0)), family = binomial, data = scale_rows)
+offset_only_fit <- glm(y ~ contacted + offset(qlogis(p0)), family = binomial, data = scale_rows)
+bind_rows(ratio_row(tier_fit, "Tier and stratum held fixed"),
+          ratio_row(offset_fit, "Base chance and stratum held fixed"),
+          ratio_row(offset_only_fit, "Base chance held fixed, no stratum terms")) |>
+  kable(digits = c(0, 2, 2, 2, 4), format.args = list(scientific = FALSE),
+        caption = "The odds ratio for contact on two scales, on the rows with a base chance")
+
+# Band givers the rule predicts against the ones observed, by tier and arm
+log_or_base_scale <- coef(offset_fit)[["contacted"]]
+bind_rows(scale_rows, mutate(scale_rows, tier = "All")) |>
+  summarise(rows = n(), observed = sum(y), base_chance_alone = sum(p0),
+            odds_ratio_tier_scale = sum(p0 + contacted * uplift(p0, log_odds_ratio)),
+            odds_ratio_base_chance_scale = sum(p0 + contacted * uplift(p0, log_or_base_scale)),
+            .by = c(tier, contacted)) |>
+  arrange(tier, contacted) |>
+  mutate(contacted = if_else(contacted == 1, "Contacted", "Held out")) |>
+  rename(arm = contacted) |>
+  kable(digits = 2, format.args = list(big.mark = ","),
+        caption = "Observed band givers and the counts the rule predicts with each odds ratio")
+```
+
+## Who Responds
+
+```{r who-responds-groups}
+# The nominations with a base chance, with what the giving record says about each person in the selection year
+# gain is what the two models predict contact adds: the odds ratio the FY2027 list uses, applied to the base chance
+who <- scale_rows |>
+  inner_join(select(pool, constituent_id, fiscal_year, total_prev, credit, daf, years_given), by = by_year) |>
+  # Contacted the year before too, in a portfolio that had adopted the program
+  left_join(cultivation |> filter(contacted, program_adopted) |>
+              transmute(constituent_id, fiscal_year = fiscal_year + 1, contacted_year_before = TRUE), by = by_year) |>
+  mutate(contacted_year_before = coalesce(contacted_year_before, FALSE),
+         gain = uplift(p0, log_odds_ratio))
+stopifnot(nrow(who) == nrow(scale_rows))
+
+# The groups the who-responds study named that the giving record can form; a nominee can be in several
+who_groups <- bind_rows("All nominees"                    = who,
+                        "Gave $600 to $1,199"             = filter(who, tier == "$600-1,199"),
+                        "Gave $250 to $599"               = filter(who, tier == "$250-599"),
+                        "Gave $1 to $249"                 = filter(who, tier == "$1-249"),
+                        "Former band giver"               = filter(who, ever_band),
+                        "In the band in the last 3 years" = filter(who, ever_band, fiscal_year - last_band_fy <= 3),
+                        "Soft credit this year"           = filter(who, credit > 0),
+                        "DAF credit this year"            = filter(who, daf > 0),
+                        "Given in 8 or more years"        = filter(who, years_given >= 8),
+                        "Given in 3 or fewer years"       = filter(who, years_given <= 3),
+                        "Gave less than the year before"  = filter(who, total_prev > 0, sel_total < total_prev),
+                        "Contacted the year before too"   = filter(who, contacted_year_before),
+                        .id = "group")
+
+# Each group against the rule: band givers seen in each arm, next to what the base chance expects of the held-out arm
+# and what the base chance with one odds ratio predicts for the contacted arm
+who_table <- who_groups |>
+  summarise(arm_effect(pick(everything())),
+            held_out_expected = sum(p0[contacted == 0]),
+            rule_predicts     = sum((p0 + gain)[contacted == 1]),
+            predicted_effect  = 100 * mean(gain[contacted == 1]),
+            .by = group)
+who_table |>
+  transmute(group, held_out = arm_text(held_events, held_n), held_out_expected,
+            contacted = arm_text(contacted_events, contacted_n), rule_predicts, effect, predicted_effect) |>
+  kable(digits = c(0, 0, 1, 0, 1, 1, 1),
+        caption = "Band givers by group: seen in each arm, and what the base chance and one odds ratio predict")
+# One row of the table by its group, for the text
+who_row <- function(g) filter(who_table, group == g)
+```
+
+**One odds ratio explains the groups that gained most.** The rule here is the base chance, raised by the one odds ratio for nominees who were contacted. For nominees who gave $600 to $1,199 it predicts `r round(who_row("Gave $600 to $1,199")$rule_predicts)` band givers among the contacted, and `r who_row("Gave $600 to $1,199")$contacted_events` occurred. For nominees with a soft credit it predicts `r round(who_row("Soft credit this year")$rule_predicts)`, and `r who_row("Soft credit this year")$contacted_events` occurred. These groups gained the most points because they started with a higher chance. Below $600 the rule runs low. For nominees who gave $250 to $599 it predicts `r round(who_row("Gave $250 to $599")$rule_predicts)`, and `r who_row("Gave $250 to $599")$contacted_events` occurred. The held-out nominees at that level beat the base chance too, with `r who_row("Gave $250 to $599")$held_events` band givers against `r round(who_row("Gave $250 to $599")$held_out_expected, 1)` expected. One reading is that officers pick people whose chance is better than their giving record shows.
+
+```{r who-responds-gain}
+# Does the predicted gain sort the trial's effect? Four groups of nominees by predicted gain:
+# the half with the lowest gain, the next three tenths, the next tenth and the top tenth
+# Cut points keep nominees with equal gains together, so the groups differ a little from those shares
+gain_cuts <- unique(quantile(who$gain, c(0, 0.5, 0.8, 0.9, 1)))
+by_gain <- who |>
+  mutate(gain_group = cut(gain, gain_cuts, include.lowest = TRUE)) |>
+  summarise(arm_effect(pick(everything())), predicted_effect = 100 * mean(gain[contacted == 1]),
+            lowest_gain = 100 * min(gain), highest_gain = 100 * max(gain), .by = gain_group) |>
+  arrange(desc(gain_group)) |>
+  mutate(added_band_givers = contacted_n * effect / 100,
+         share_of_contacts = 100 * contacted_n / sum(contacted_n),
+         share_of_added    = 100 * added_band_givers / sum(added_band_givers))
+by_gain |>
+  transmute(predicted_gain = sprintf("%.1f to %.1f", lowest_gain, highest_gain),
+            contacted = arm_text(contacted_events, contacted_n), held_out = arm_text(held_events, held_n),
+            effect, predicted_effect, share_of_contacts, share_of_added) |>
+  kable(digits = c(0, 0, 0, 1, 1, 0, 0), caption = "Effect of contact by predicted gain in points, highest gain first")
+# The two ends of the table, for the text
+top_gain <- slice_head(by_gain, n = 1)
+bottom_gain <- slice_tail(by_gain, n = 1)
+```
+
+**The predicted gain sorts the trial's effect.** In the tenth of nominees with the highest predicted gain, contact added `r round(top_gain$effect, 1)` points. In the half with the lowest predicted gain, it added `r round(bottom_gain$effect, 1)`. That half took `r round(bottom_gain$share_of_contacts)`% of the contacts and gave `r round(bottom_gain$share_of_added)`% of the added band givers. Each row has `r min(by_gain$held_events)` to `r max(by_gain$held_events)` held-out band givers, so one row's effect is rough. The order of the rows is the finding.
+
+**Three traits might change the odds ratio itself, and none is proven.** A separate study of who responds to contact named age 80 or older, the Alumni constituent type, and a contact in two years running. Age and constituent type are in the memberships table, which this notebook never joins, so they are named here and not tested. In that study each rested on 2 held-out band givers. The third is the last row of the first table, with `r who_row("Contacted the year before too")$held_events` held-out band givers. Write all three down before the station's own records arrive, and test them there.
+
+## The FY2027 List
+
+```{r fy2027-list}
+# Model 1's base chance from every untreated pool row, outcome years FY2001 to FY2026
+final_fit <- quiet_glm(form, filter(pool, untreated))
+
+# Model 1's inputs for everyone who gave under $1,200 in year t, built the way the panel builds them
+list_rows <- function(t) {
+  giving_history |>
+    filter(fiscal_year == t, total < 1200) |>
+    left_join(person_year |> mutate(fiscal_year = fiscal_year + 1) |>
+                select(constituent_id, fiscal_year, total_prev = total), by = by_year) |>
+    mutate(total_prev = coalesce(total_prev, 0),
+           level = factor(case_when(total < 250 ~ "$1-249", total < 600 ~ "$250-599", .default = "$600-1,199"),
+                          levels = levels(pool$level)),
+           never_band = last_band_fy == 0,
+           yrs_since_band = if_else(never_band, 10, pmin(fiscal_year - last_band_fy, 10)),
+           trial_era = fiscal_year >= 2022)
+}
+# Check: for FY2025 the same code returns the pool's own FY2025 rows
+check_rows <- inner_join(list_rows(2025), filter(pool, fiscal_year == 2025), by = by_year, suffix = c("", "_pool"))
+stopifnot(nrow(check_rows) == sum(pool$fiscal_year == 2025), nrow(check_rows) == nrow(list_rows(2025)),
+          all(check_rows$total_prev == check_rows$total_prev_pool), all(check_rows$level == check_rows$level_pool),
+          all(check_rows$yrs_since_band == check_rows$yrs_since_band_pool))
+
+# The list: FY2026 givers under $1,200, each with a base chance and the gain from contact, highest gain first
+# People with equal gains have the same inputs, so the person ID only fixes their order
+fy2027 <- list_rows(2026)
+fy2027 <- fy2027 |>
+  mutate(p0 = predict(final_fit, fy2027, type = "response"), gain = uplift(p0, log_odds_ratio),
+         # The same people at the crossing rate of the years before the trial, for the last table of this section
+         p0_earlier = predict(final_fit, mutate(fy2027, trial_era = FALSE), type = "response"),
+         gain_earlier = uplift(p0_earlier, log_odds_ratio)) |>
+  arrange(desc(gain), constituent_id)
+
+# The fit behind the base chance, and the size of the list
+# trial_era_odds_ratio is the odds of crossing with no contact in the trial years, against the earlier years
+tibble(training_rows = nobs(final_fit), training_crossers = sum(final_fit$y), list_people = nrow(fy2027),
+       over_turning_point = sum(fy2027$p0 > turning_point), highest_base_chance_pct = 100 * max(fy2027$p0),
+       trial_era_odds_ratio = exp(coef(final_fit)[["trial_eraTRUE"]])) |>
+  kable(digits = c(0, 0, 0, 0, 1, 2), format.args = list(big.mark = ","), caption = "The final Model 1 fit and the FY2027 list")
+
+# The list by giving level in FY2026
+fy2027 |>
+  summarise(people = n(), mean_base_chance_pct = 100 * mean(p0), mean_gain_points = 100 * mean(gain),
+            sum_base_chances = sum(p0), sum_gains = sum(gain), .by = level) |>
+  arrange(level) |>
+  kable(digits = 2, format.args = list(big.mark = ","), caption = "The FY2027 list by giving level in FY2026")
+
+# The top of the list at the three list sizes
+map(c(149, 658, 875), \(k) head(fy2027, k) |>
+      summarise(top = k, from_600_1199 = sum(level == "$600-1,199"), from_250_599 = sum(level == "$250-599"),
+                ever_in_band = sum(yrs_band > 0), band_givers_no_contact = sum(p0), extra_from_contact = sum(gain),
+                contacts_per_extra_donor = k / sum(gain), lowest_gain_points = 100 * min(gain))) |>
+  list_rbind() |>
+  kable(digits = 1, caption = "The top of the FY2027 list at three list sizes")
+
+# The same names if the crossing rate of the years before the trial came back, as it did in FY2026
+map(c(149, 658, 875), \(k) head(fy2027, k) |>
+      summarise(top = k, band_givers_no_contact = sum(p0_earlier), extra_from_contact = sum(gain_earlier),
+                contacts_per_extra_donor = k / sum(gain_earlier))) |>
+  list_rbind() |>
+  kable(digits = 1, caption = "The top of the FY2027 list at the crossing rate of the years before the trial")
+```
+
+## What the Next Trial Needs
+
+```{r next-trial}
+# How far the trial is from telling the odds ratio for former band givers from the one for everyone else
+# The standard error of the log ratio of the two raw odds ratios combines their eight cells
+ever_never <- filter(band_table, group %in% c("Ever in the band", "Never in the band"))
+se_now <- sqrt(sum(ever_never$se^2))
+# Strata in the trial now, and strata a year once every portfolio has adopted
+strata_now <- n_distinct(adopted$portfolio_year)
+strata_a_year <- n_distinct(trial$portfolio_id)
+# The share of that uncertainty that comes from the two held-out band-giver counts
+held_share <- sum(1 / ever_never$held_events) / se_now^2
+multiplier_trial <- tibble(ratio_to_detect = 2:4) |>
+  # 80% power at the 5% level; the standard error shrinks with the square root of the sample
+  mutate(se_needed = log(ratio_to_detect) / (qnorm(0.975) + qnorm(0.8)),
+         times_this_trial = (se_now / se_needed)^2,
+         more_years = (times_this_trial - 1) * strata_now / strata_a_year)
+kable(multiplier_trial, digits = c(0, 3, 1, 1),
+      caption = paste0("Trial size needed to detect a different odds ratio for former band givers; the standard error now is ",
+                       round(se_now, 3), ", and held-out band givers supply ", round(100 * held_share), "% of its variance"))
+
+# A trial for people currently in the band, none of whom was nominated: people needed to detect a rise in the stay rate
+stay_rate <- sum(band_flow$stayed) / sum(band_flow$in_band_year_before)
+band_givers_now <- last(band_flow$in_band_outcome_year)
+# A 3-to-1 split needs (3 + 1)^2 / (4 * 3) times the people of an even split
+uneven_cost <- (3 + 1)^2 / (4 * 3)
+stay_trial <- tibble(rise_points = c(5, 10, 15)) |>
+  mutate(people_even_split = map_dbl(rise_points, \(r) 2 * ceiling(power.prop.test(p1 = stay_rate, p2 = stay_rate + r / 100, power = 0.8)$n)),
+         people_3_to_1 = ceiling(people_even_split * uneven_cost),
+         years_even_split = people_even_split / band_givers_now,
+         years_3_to_1 = people_3_to_1 / band_givers_now)
+kable(stay_trial, digits = 1, format.args = list(big.mark = ","),
+      caption = paste0("People and years needed to detect a rise in the stay rate from ", round(100 * stay_rate, 1),
+                       "%, with ", band_givers_now, " band givers a year"))
+```
+
+# Business Value and Recommendations
+
+```{r business-value}
+# The ranking tests from the business problem statement, on untreated pool rows in each test year:
+# ROC-AUC, and band givers in the top 149 names next to a random list of 149
+scorecard <- forward |>
+  filter(scorer %in% c("rule", "model")) |>
+  mutate(random_list = 149 * crossers / rows, times_random = hits_149 / random_list) |>
+  select(outcome_fy, scorer, crossers, roc_auc, hits_149, random_list, times_random) |>
+  arrange(outcome_fy, scorer)
+scorecard |>
+  mutate(outcome_fy = as.character(outcome_fy)) |>
+  kable(digits = c(0, 0, 0, 3, 1, 2, 0),
+        caption = "The ranking tests by test year: ROC-AUC, and band givers in the top 149 names next to a random list of 149")
+model_2026 <- filter(scorecard, outcome_fy == 2026, scorer == "model")
+rule_2026 <- filter(scorecard, outcome_fy == 2026, scorer == "rule")
+
+# People officers did not pick: band givers in the model's top 149 names, by test year
+not_picked_hits <- views |>
+  filter(view == "C. Not selected for cultivation") |>
+  summarise(hits_149 = hits_at(p, y, 149), .by = outcome_fy)
+
+# What working the list is worth, in three blocks of names: band givers expected with no contact,
+# the band givers contact adds, and the contacts it takes to add one
+# The dollar column is an illustration: each added band giver is valued at the median increase in giving
+# among the people who crossed into the band from FY2022 to FY2026
+pool_crossers <- filter(pool, y == 1, outcome_fy >= 2022)
+median_increase <- median(pool_crossers$total_next - pool_crossers$total)
+# The measured columns use the trial: its dollar effect per contact, divided by its band effect,
+# is the dollars that came with each added band giver, in all credit and in the person's own money
+band_effect <- outcome_row("band")$effect / 100
+dollars_per_added <- outcome_row("dollars")$effect / band_effect
+own_dollars_per_added <- outcome_row("own_dollars")$effect / band_effect
+list_value <- tibble(to = c(149, 658, 875), from = lag(to, default = 0) + 1) |>
+  mutate(names = to - from + 1,
+         band_givers_no_contact = map2_dbl(from, to, \(a, b) sum(fy2027$p0[a:b])),
+         added_by_contact = map2_dbl(from, to, \(a, b) sum(fy2027$gain[a:b])),
+         contacts_per_added_band_giver = names / added_by_contact,
+         dollars_at_median_increase = added_by_contact * median_increase,
+         dollars_measured = added_by_contact * dollars_per_added,
+         own_dollars_measured = added_by_contact * own_dollars_per_added)
+list_value |>
+  transmute(names_on_list = paste(from, "to", to), names, band_givers_no_contact, added_by_contact,
+            contacts_per_added_band_giver, dollars_at_median_increase) |>
+  kable(digits = c(0, 0, 1, 1, 1, 0), format.args = list(big.mark = ","),
+        caption = "What contacting each block of the FY2027 list adds, with an illustration in dollars")
+# The same blocks in dollars: the illustration next to the dollars the trial measured
+list_value |>
+  transmute(names_on_list = paste(from, "to", to), dollars_at_median_increase, dollars_measured, own_dollars_measured) |>
+  kable(digits = 0, format.args = list(big.mark = ","),
+        caption = "Dollars added by contacting each block of the FY2027 list: the illustration and the trial's measured dollars")
+
+# For scale: what the whole band gave in FY2026, and the yearly shortfall in the business problem statement
+band_dollars_2026 <- sum(filter(person_year, fiscal_year == 2026, in_band(total))$total)
+shortfall <- 230000
+# Values the text below quotes: the overall tier row, former band givers, the top 149 names,
+# and the band givers the rule predicts among contacted nominees
+all_tier <- filter(tier_table, tier == "All")
+former <- filter(band_table, group == "Ever in the band")
+top_149 <- head(fy2027, 149)
+rule_predicts <- with(filter(scale_rows, contacted == 1), sum(p0 + uplift(p0, log_odds_ratio)))
+# The contacted nominees of FY2023 and FY2024 who reached the band, to see how many stayed a second year
+entrants <- filter(two_year, contacted == 1, y == 1)
+```
+
+## Business Value
+
+**The station gets a ranked list of prospects and a measured return for contacting them.** The list covers the `r scales::comma(nrow(fy2027))` people who gave less than $1,200 in FY2026. Model 1 gives each person a chance of giving in the band next year without contact. Model 2 adds the gain to expect from an officer's contact.
+
+**The ranking passes two of the three tests in the business problem statement.** In the FY2026 forward test, the model's ROC-AUC was `r round(model_2026$roc_auc, 3)`, well past the 0.75 target. Its top 149 names included `r round(model_2026$hits_149)` of the `r model_2026$crossers` people who reached the band without contact. A random list of that size would include about `r round(model_2026$random_list, 1)`. The model also had to beat what a fundraiser would already do, and it doesn't by enough to matter. A rule that sorts people by giving level and earlier years in the band also found `r round(rule_2026$hits_149)`. Over the twelve test years before the trial, the model's top 149 names each year held `r round(early_model$hits_149)` of `r early_model$crossers` crossers and the rule's held `r round(early_rule$hits_149)`. The station can run that rule by hand and get nearly the same names at the top. The model adds the base chance, which sets the size of the gain from contact.
+
+**Contact works, and it pays most close to the band.** In the trial data, `r all_tier$contacted_events` of `r scales::comma(all_tier$contacted_n)` contacted nominees gave in the band the next year, compared with `r all_tier$held_events` of `r all_tier$held_n` held-out nominees. That's a gain of `r round(all_tier$effect, 1)` points, or about `r round(100 / all_tier$effect)` contacts for each added band giver. For nominees who gave $600 to $1,199, it took about `r round(100 / tier_table$effect[tier_table$tier == "$600-1,199"])` contacts. For nominees who gave less than $250, it took about `r round(100 / tier_table$effect[tier_table$tier == "$1-249"])`.
+
+**The first names on the list carry most of the value.** Contacting the top 149 names would add about `r round(list_value$added_by_contact[1])` band givers to the `r round(list_value$band_givers_no_contact[1])` expected without contact. That's about `r round(list_value$contacts_per_added_band_giver[1])` contacts for each one. The next `r list_value$names[2]` names would add about `r round(list_value$added_by_contact[2])` more, at about `r round(list_value$contacts_per_added_band_giver[2])` contacts each. The `r list_value$names[3]` names after those would add about `r round(list_value$added_by_contact[3])`.
+
+**In dollars, the gain is small next to the shortfall.** People who crossed into the band from FY2022 to FY2026 increased their giving by a median of `r scales::dollar(median_increase)`. At that amount, the band givers added by contacting the top 658 names would give about `r scales::dollar(sum(list_value$dollars_at_median_increase[1:2]), accuracy = 1000)` more a year. The whole band gave `r scales::dollar(band_dollars_2026)` in FY2026, and the business problem statement puts the yearly shortfall at about `r scales::dollar(shortfall)`. Treat the dollar figure as an illustration.
+
+**The trial measures the dollars too, and most of them are soft credit.** Contact raised a nominee's giving the next year by about `r scales::dollar(outcome_row("dollars")$effect, accuracy = 1)`, counting each yearly total up to `r cap_text`. Of that, `r scales::dollar(outcome_row("own_dollars")$effect, accuracy = 1)` was the person's own money, and the rest was soft credit. Divided by the band effect, that is about `r scales::dollar(dollars_per_added, accuracy = 10)` for each added band giver. For the top 658 names it comes to about `r scales::dollar(sum(list_value$dollars_measured[1:2]), accuracy = 1000)` in the year after contact, or `r scales::dollar(sum(list_value$own_dollars_measured[1:2]), accuracy = 1000)` in own money. The cap decides this result. Among held-out nominees, `r sum(outcomes$next_total > 25000 & outcomes$contacted == 0)` gave more than $25,000 the next year. With no cap the estimate is `r scales::dollar(outcome_row("dollars_no_cap")$effect, accuracy = 1)`, with a range of `r scales::dollar(outcome_row("dollars_no_cap")$low, accuracy = 1)` to `r scales::dollar(outcome_row("dollars_no_cap")$high, accuracy = 1)`.
+
+**Half of the trial's contacts added almost nothing.** Sorted by predicted gain, the lower half of nominees took `r bottom_gain$contacted_n` contacts and added about `r round(bottom_gain$added_band_givers)` band givers. The top tenth took `r top_gain$contacted_n` contacts and added about `r round(top_gain$added_band_givers)`. At the trial's average gain, 149 contacts add about `r round(149 * all_tier$effect / 100)` band givers. The top 149 names on the list are predicted to add about `r round(list_value$added_by_contact[1])`.
+
+**The gain fades after the first year.** For nominees selected in FY2023 and FY2024, contact added `r round(outcome_row("band_first_year")$effect, 1)` points of band giving the next year and `r round(outcome_row("band_in_two_years")$effect, 1)` points the year after, with a range of `r round(outcome_row("band_in_two_years")$low, 1)` to `r round(outcome_row("band_in_two_years")$high, 1)`. Of the `r nrow(entrants)` contacted nominees who reached the band, `r sum(entrants$band_in_two_years)` were still in it a year later. Count the value above as one year's worth, unless a later trial shows that it lasts.
+
+## Lapsed Donors
+
+```{r lapsed-donors}
+# A lapsed person in year t gave in an earlier year and gave nothing in year t - 1
+# One row per lapsed person for each year from FY2021, the first year with campaign lists
+lapsed_in <- function(t) {
+  person_year |>
+    filter(fiscal_year < t) |>
+    summarise(last_fy = max(fiscal_year), .by = constituent_id) |>
+    filter(last_fy < t - 1) |>
+    mutate(fiscal_year = t)
+}
+# A person is on a year's list when a campaign row names them that year with no response; a response is a payment
+# Every campaign starts on July 1, so a list gives the year of an appeal and not whether it came before a gift
+on_list <- campaign_members |>
+  filter(!responded) |>
+  distinct(constituent_id, fiscal_year = fy(campaign_start_date))
+lapsed <- map(2021:2026, lapsed_in) |>
+  list_rbind() |>
+  left_join(person_year |> select(constituent_id, fiscal_year, total), by = by_year) |>
+  left_join(mutate(on_list, on_list = TRUE), by = by_year) |>
+  # The list of the year before: the person gave nothing that year, so that list can't follow a gift
+  left_join(mutate(on_list, fiscal_year = fiscal_year + 1, on_list_before = TRUE), by = by_year) |>
+  # Years in the band up to the last gift
+  left_join(giving_history |> select(constituent_id, last_fy = fiscal_year, yrs_band),
+            by = c("constituent_id", "last_fy")) |>
+  mutate(total = coalesce(total, 0), back = total > 0, band = in_band(total),
+         on_list = coalesce(on_list, FALSE), on_list_before = coalesce(on_list_before, FALSE))
+
+# FY2026: lapsed people by the last year they gave, with everyone on the last row
+gift_eras <- c("Before FY2010", "FY2010 to FY2018", "FY2019 to FY2022", "FY2023 to FY2024", "All lapsed people")
+lapsed_2026 <- filter(lapsed, fiscal_year == 2026)
+by_last_gift <- lapsed_2026 |>
+  mutate(last_gift = cut(last_fy, c(-Inf, 2009, 2018, 2022, 2024), labels = gift_eras[1:4])) |>
+  bind_rows(mutate(lapsed_2026, last_gift = gift_eras[5])) |>
+  summarise(people = n(), came_back = sum(back), came_back_pct = 100 * mean(back),
+            median_gift = median(total[back]), reached_band = sum(band), .by = last_gift) |>
+  arrange(match(last_gift, gift_eras))
+kable(by_last_gift, digits = c(0, 0, 0, 1, 0, 0), format.args = list(big.mark = ","),
+      caption = "Lapsed people going into FY2026 by the last year they gave, and how many gave again that year")
+
+# The share of lapsed people who came back, on a list and off it, for two lists: that year's list,
+# and the list of the year before (FY2020 has no lists, so that one starts in FY2022)
+campaign_checks <- bind_rows(
+  "That year's list"            = transmute(lapsed, fiscal_year, back, listed = on_list),
+  "The list of the year before" = lapsed |> filter(fiscal_year >= 2022) |> transmute(fiscal_year, back, listed = on_list_before),
+  .id = "list") |>
+  summarise(on_list_pct = 100 * mean(listed), came_back_pct = 100 * mean(back),
+            back_if_on_list = 100 * mean(back[listed]), back_if_off_list = 100 * mean(back[!listed]),
+            .by = c(list, fiscal_year))
+campaign_checks |>
+  mutate(fiscal_year = as.character(fiscal_year)) |>
+  kable(digits = 1, caption = "Lapsed people by year: the share on a campaign list, and the share who came back on and off it")
+# Rows of that table the text quotes
+same_year <- filter(campaign_checks, list == "That year's list")
+same_year_2026 <- filter(same_year, fiscal_year == 2026)
+year_before_2026 <- filter(campaign_checks, list == "The list of the year before", fiscal_year == 2026)
+
+# Everyone who gave in FY2026, and those of them on an FY2026 list
+givers_2026 <- filter(person_year, fiscal_year == 2026)
+givers_2026_on_list <- semi_join(givers_2026, on_list, by = by_year)
+# What the lapsed people on no FY2026 list would give at the average of the lapsed people on a list
+off_list_value <- sum(!lapsed_2026$on_list) * mean(lapsed_2026$total[lapsed_2026$on_list])
+# Lapsed people who had been in the band before and had missed only one year, FY2021 to FY2026: one row for each
+# person and year, so a person who did this twice has two rows. And the same group going into FY2027, one row each:
+# they gave in FY2025 and gave nothing in FY2026
+skipped_one <- filter(lapsed, yrs_band > 0, last_fy == fiscal_year - 2)
+skipped_2026 <- giving_history |>
+  filter(fiscal_year == 2025, yrs_band > 0) |>
+  anti_join(givers_2026, by = "constituent_id")
+# People a test needs in each group to detect a one-point rise in the share who come back
+back_rate <- mean(lapsed_2026$back)
+test_group <- ceiling(power.prop.test(p1 = back_rate, p2 = back_rate + 0.01, power = 0.8)$n)
+```
+
+**Lapsed donors come back at about `r round(100 * back_rate)`% a year, however long ago they last gave.** A lapsed person gave in an earlier year and gave nothing the year before. Going into FY2026 there were `r scales::comma(nrow(lapsed_2026))` of them, and `r scales::comma(sum(lapsed_2026$back))` gave again that year. They gave `r scales::dollar(sum(lapsed_2026$total), accuracy = 1000)` in total, at a median of `r scales::dollar(median(lapsed_2026$total[lapsed_2026$back]))` each. People whose last gift came before FY2010 came back at `r round(by_last_gift$came_back_pct[1], 1)`%, and people who last gave in FY2023 or FY2024 at `r round(by_last_gift$came_back_pct[4], 1)`%.
+
+**Model 1 leaves lapsed people out, because they almost never reach the band.** In FY2026, `r sum(lapsed_2026$band)` of the `r scales::comma(nrow(lapsed_2026))` lapsed people reached it. Of the `r scales::comma(sum(pool$fiscal_year == 2025))` people who gave less than $1,200 in FY2025, `r sum(pool$y[pool$fiscal_year == 2025])` reached it. The trial can't size a contact for lapsed people either, because `r sum(trial$sel_total == 0)` of its `r scales::comma(nrow(trial))` nominations went to someone who gave nothing in the selection year. One small group does better. From FY2021 to FY2026 there were `r nrow(skipped_one)` cases of a lapsed person who had been in the band before and had missed only one year, and in `r sum(skipped_one$band)` of them the person returned to the band. Going into FY2027 that group has `r nrow(skipped_2026)` people.
+
+**The campaign lists can't show that an appeal brings lapsed donors back.** Of the lapsed people on an FY2026 campaign list, `r round(same_year_2026$back_if_on_list, 1)`% gave again that year. Of those on no list, `r round(same_year_2026$back_if_off_list, 1)`% did. That gap shows who is on the lists, not what a list does. The lists name nearly everyone who gave that year: `r scales::comma(nrow(givers_2026_on_list))` of the `r scales::comma(nrow(givers_2026))` people who gave in FY2026, and `r scales::comma(sum(lapsed_2026$back & lapsed_2026$on_list))` of the `r scales::comma(sum(lapsed_2026$back))` lapsed people who came back. From FY2021 to FY2026 the share of lapsed people on a list ranged from `r round(min(same_year$on_list_pct))`% to `r round(max(same_year$on_list_pct))`%, and the share who came back stayed between `r round(min(same_year$came_back_pct), 1)`% and `r round(max(same_year$came_back_pct), 1)`%. The list of the year before is a cleaner test. A lapsed person gave nothing that year, so that list can't follow a gift. In FY2026, lapsed people who had been on the FY2025 list came back at `r round(year_before_2026$back_if_on_list, 1)`%, and those who hadn't at `r round(year_before_2026$back_if_off_list, 1)`%.
+
+**So this data can't put a value on appealing to more lapsed donors.** In FY2026, `r scales::comma(sum(!lapsed_2026$on_list))` lapsed people were on no campaign list. The checks here don't show what an appeal to them would bring. An appeal may still work at the station. Only a test with a random group held out can show it.
+
+## Recommendations
+
+1. **Work the list from the top, and stop when the gain runs out.** Of the top 149 names, `r sum(top_149$level == "$600-1,199")` gave $600 to $1,199. Of those 149, `r sum(top_149$yrs_band > 0)` were in the band in an earlier year. Past the 658th name, each added band giver takes about `r round(list_value$contacts_per_added_band_giver[3])` contacts.
+2. **Put former band givers first.** In the trial data, `r former$contacted_events` of `r former$contacted_n` contacted former band givers returned to the band, compared with `r former$held_events` of `r former$held_n` held out. The top 149 names already include `r sum(top_149$yrs_since_band <= 2)` of the `r sum(fy2027$yrs_since_band <= 2)` people who left the band in the last two years.
+3. **Use the list alongside officers' own picks.** Among people officers didn't nominate, the model's top 149 names included about `r round(max(not_picked_hits$hits_149))` person who reached the band in each test year. Officers' nominations use information that the giving record doesn't have.
+4. **Put current band givers in the next trial.** Over five years, `r sum(band_flow$left)` people left the band and `r sum(band_flow$entered)` entered it. Nobody in the band was in the trial. It doesn't show what contact does for them. A trial of every band giver, split evenly, could detect a 15-point increase in the share who give in the band again within about `r round(stay_trial$years_even_split[stay_trial$rise_points == 15], 1)` years.
+5. **Hold out more nominees.** Held-out band givers account for `r round(100 * held_share)`% of the uncertainty about whether contact works better on former band givers. With 94 contacted and 31 held out in each of eight portfolios a year, detecting a fourfold difference would take about `r round(multiplier_trial$more_years[multiplier_trial$ratio_to_detect == 4], 1)` more years.
+6. **Skip nominees with almost no predicted gain.** In the trial data, `r bottom_gain$contacted_n` of the `r scales::comma(sum(by_gain$contacted_n))` contacts went to the lower half of nominees by predicted gain, and they added about `r round(bottom_gain$added_band_givers)` band givers. Of the `r who_row("Gave $1 to $249")$contacted_n` contacted nominees who gave less than $250, `r who_row("Gave $1 to $249")$contacted_events` reached the band. Of the `r who_row("Given in 3 or fewer years")$contacted_n` with 3 or fewer giving years, `r who_row("Given in 3 or fewer years")$contacted_events` did.
+7. **Decide now which traits the next trial will test.** Age 80 or older, the Alumni constituent type and a second contact in a row might each change the effect of contact. Each rests on 2 or 3 held-out band givers. Writing them down before the station's own records arrive keeps the test honest.
+8. **Follow the people contact brings into the band.** Of the `r nrow(entrants)` contacted nominees who reached the band after selection in FY2023 or FY2024, `r sum(entrants$band_in_two_years)` stayed a second year. Holding out some new band givers from further contact would show whether more contact keeps them.
+9. **Test an appeal to lapsed donors with a random group held out before counting on it.** About `r round(100 * back_rate, 1)`% of lapsed people come back in a year, and the campaign lists can't show whether an appeal changes that. To detect a rise of one point, a test needs about `r scales::comma(test_group)` lapsed people who get the appeal and as many who don't. Officers can check by hand the `r nrow(skipped_2026)` former band givers who gave in FY2025 and not in FY2026.
+10. **Re-estimate every figure on the station's own records before acting.** These data are synthetic, and the data dictionary says the project invented the cultivation and officer tables for teaching.
+
+## Limits
+
+Every Model 2 result rests on `r all_tier$held_events` held-out band givers. The gains on the list apply the trial's odds ratio to people who weren't in the trial, and most of them were never nominated. The base chance ranks people well but miscounts them. With it, the rule predicts `r round(rule_predicts)` band givers among contacted nominees, and `r all_tier$contacted_events` occurred. The right size for the base chance is uncertain too. From FY2023 to FY2025, people who weren't contacted reached the band `r round(sum(trial_level$observed[1:3]) / sum(trial_level$expected[1:3]), 2)` times as often as the earlier years predict, and in FY2026 they matched them. At the earlier rate, the top 149 names would hold about `r round(sum(top_149$p0_earlier))` band givers without contact, not `r round(list_value$band_givers_no_contact[1])`. The trial is too small to show whether contact works better on former band givers. It has no one who was in the band at the time.
+
+# Conclusion
+
+**The model ranks prospects well, and a rule the station can run by hand ranks them about as well.** In the FY2026 forward test, the model's ROC-AUC was `r round(model_2026$roc_auc, 3)`, past the 0.75 target. Its top 149 names included `r round(model_2026$hits_149)` of the `r model_2026$crossers` people who reached the band without contact. The rule that sorts people by giving level and earlier years in the band found `r round(rule_2026$hits_149)` of them too. The model adds the base chance, which sets the size of the gain from contact.
+
+**Officer contact adds band givers.** In the trial data, `r all_tier$contacted_events` of `r scales::comma(all_tier$contacted_n)` contacted nominees gave in the band the next year, compared with `r all_tier$held_events` of `r all_tier$held_n` held-out nominees. That's a gain of `r round(all_tier$effect, 1)` points, or about `r round(100 / all_tier$effect)` contacts for each added band giver. For nominees who gave $600 to $1,199, it took about `r round(100 / tier_table$effect[tier_table$tier == "$600-1,199"])` contacts. Contacting the top 149 names on the FY2027 list would add about `r round(list_value$added_by_contact[1])` band givers.
+
+**The list helps, but it won't close the shortfall alone.** As an illustration, the band givers added by contacting the top 658 names would give about `r scales::dollar(sum(list_value$dollars_at_median_increase[1:2]), accuracy = 1000)` more a year. The business problem statement puts the yearly shortfall at about `r scales::dollar(shortfall)`. Every result about contact rests on `r all_tier$held_events` held-out band givers, and the data are synthetic. The station should re-estimate each figure on its own records before acting on it.
+
+# Historical Notes
+
+The current analysis doesn't support the figures in this section. Don't quote them as results.
+
+**An earlier estimate valued an appeal to lapsed donors at about `r scales::dollar(off_list_value, accuracy = 10000)` a year.** In FY2026, `r scales::comma(sum(!lapsed_2026$on_list))` lapsed people were on no campaign list. The estimate gave each of them the `r scales::dollar(mean(lapsed_2026$total[lapsed_2026$on_list]), accuracy = 0.01)` that a listed lapsed person gave on average. That assumes the lists caused the gifts, and the checks in Lapsed Donors don't support that.
+
+# Claude Code use note
+
+Rex Linder built this notebook with Claude Code, Anthropic's AI coding assistant, and directed each step. Claude Code first wrote a step guide for each model, with pseudocode and the values each step had to reproduce. It then wrote the R code and drafted the prose. On 2026-11-18, Claude sessions applied scripted edits for the larger training pool, the who-responds sections, and the lapsed-donor section. A new render and a rebuild of the tables in Python checked each set of edits. Claude Code also drafted the Conclusion and the Historical Notes, and Rex approved each change.
